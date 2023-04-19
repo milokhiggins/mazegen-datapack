@@ -1,1 +1,1 @@
-mchy.exe -v  --overwrite-log --log-file mazegen_build.log -o C:\Users\milok\AppData\Roaming\.minecraft\saves\mchy\datapacks mazegen.mchy
+mchy.exe -v  --overwrite-log --log-file mazegen_build.log -o . mazegen.mchy
