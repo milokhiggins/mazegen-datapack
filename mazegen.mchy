@@ -1,0 +1,504 @@
+# Setup scoreboards
+world.scoreboard.add_obj("clicked", "minecraft.used:minecraft.carrot_on_a_stick")
+world.scoreboard.add_obj("maze_setup_state")
+world.scoreboard.add_obj("maze_confirm_trigger", "trigger")
+world.scoreboard.add_obj("maze_placement_valid")
+world.scoreboard.add_obj("maze_pos")
+
+# Setup teams (no team command yet)
+/team add blue_highlight
+/team modify blue_highlight color blue
+/team modify blue_highlight collisionRule never
+/team add red_highlight
+/team modify red_highlight color red
+/team modify red_highlight collisionRule never
+
+
+let SLIME_MARKER_NBT:str! = "{NoGravity:1b, Invulnerable:1b, NoAI:1b, Glowing:1b, Size:1, DeathLootTable:\"minecraft:empty\"}"
+let MAGIC_STICK_NBT:str! = "{display:{Name:'{\"text\":\"Magic Stick\",\"color\":\"dark_purple\",\"bold\":true}'},SpecialStick:1b}"
+let HOLD_MAGIC_STICK_NBT:str! = "{SelectedItem:{id:\"minecraft:carrot_on_a_stick\",tag:{SpecialStick:1b}}}"
+let HAS_MAGIC_STICK_NBT:str! = "{Inventory:[{id:\"minecraft:carrot_on_a_stick\",tag:{SpecialStick:1b}}]}"
+
+
+# For debugging only
+world.scoreboard.conf.display.sidebar("maze_setup_state")
+
+var validation_err_code:int = 0
+var maze_generating:bool = False
+var tick_count:int = 0
+
+@ticking
+def check_stick_used() {
+    let player:Player = world.get_player().with_score("clicked", min=1).find()
+    let playerWithSpecial:Player = world.get_player().with_score("clicked", min=1).matching_nbt(HOLD_MAGIC_STICK_NBT).find()
+    playerWithSpecial.used_magic_stick()
+    player.reset_score()
+}
+
+
+
+def Player reset_score() {
+    this.scoreboard.obj("clicked").set(0)
+}
+
+def Player used_magic_stick() {
+    
+    this.setup_ray_cast(20)
+}
+
+def Player give_magic_stick() {
+    this.give("minecraft:carrot_on_a_stick", 1, MAGIC_STICK_NBT)
+    print(world.colors.red, "Have a magic stick!")
+}
+
+
+# Perform a ray cast to find the first block in the players
+def Entity ray_cast(pl: Player, range: int) {
+    var detected_block:bool = false
+    
+    for i in 1..range {
+        let updatedPos:Pos = this.pos.get_directed(rz=0.5)
+        this.tp(updatedPos)
+        let in_air_block:bool = world.block_exists(updatedPos, "minecraft:air")
+        if (not in_air_block) {
+            # Nudge futher
+            this.tp(this.pos.get_directed(rz=0.5))
+            this.action(pl)
+            return null
+        }
+    }
+}
+  
+def Player setup_ray_cast(range: int) {
+    let caster:Entity = world.summon(this.pos.get(), "minecraft:armor_stand", "{Invisible: 1b, NoGravity: 1b, Invulnerable: 1b}")
+    caster.rotate.match(this)
+    let updatedPos:Pos = caster.pos.get(dy=1.5)
+    caster.tp(updatedPos)
+    caster.ray_cast(this, range)
+    caster.kill()
+}
+
+def Player do_confirm_dialog() {
+    this.scoreboard.obj("maze_confirm_trigger").enable()
+    /tellraw @p ["Confirm maze placement: ", {"text":"[Build]","color":"green","clickEvent":{"action":"run_command","value":"/trigger maze_confirm_trigger set 1"}}, " ", {"text":"[Cancel]","color":"red","clickEvent":{"action":"run_command","value":"/trigger maze_confirm_trigger set 2"}}]
+    
+}
+
+def Entity action(pl: Player) {
+
+    var state:int = pl.scoreboard.obj("maze_setup_state").get()
+    
+    if state < 2 {
+        this.tag_add("mg_pos_tag")    
+        /execute at @e[tag=mg_pos_tag,limit=1] run execute align xyz run tp @s ~ ~ ~
+    }
+    
+    let pos:Pos = this.pos.get(dx=0.5, dz=0.5)
+    if state == 0 {
+        remove_pos_markers()
+        var mark1:Entity = world.summon(pos, "minecraft:slime", SLIME_MARKER_NBT)
+        mark1.tag_add("marker1")
+        mark1.tag_add("pos_marker")
+        mark1.effect_add("minecraft:invisibility", 40, 1, False)
+        # WORKAROUND: team cmd out of scope for initial release. Coming Soon(TM).
+        ###mark1.team.join("blue_highlight")
+        /team join blue_highlight @e[tag=marker1]
+        pl.scoreboard.obj("maze_setup_state").set(1)
+        pl.scoreboard.obj("maze_placement_valid").set(1)
+    } elif state == 1 {
+        var mark2:Entity = world.summon(pos, "minecraft:slime", SLIME_MARKER_NBT)
+        mark2.tag_add("marker2")
+        mark2.tag_add("pos_marker")
+        mark2.effect_add("minecraft:invisibility", 40, 1, False)
+        # WORKAROUND: see above workaround
+        ###mark2.team.join("red_highlight")
+        /team join red_highlight @e[tag=marker2]
+        pl.scoreboard.obj("maze_placement_valid").set(1)
+        pl.do_confirm_dialog()
+        pl.scoreboard.obj("maze_setup_state").set(0)
+    }
+}
+
+@ticking
+def make_markers_invis() {
+    let markers:Group[Entity] = world.get_entities().with_tag("pos_marker").find()
+    markers.effect_add("minecraft:invisibility", 40, 1, False)
+}
+
+def Player dialog_action() {
+    let val:int = this.scoreboard.obj("maze_confirm_trigger").get()
+    # Reset score
+    this.scoreboard.obj("maze_confirm_trigger").set(0)
+    
+    var cleanup:bool = True
+    if val == 1 {
+        if this.scoreboard.obj("maze_placement_valid").get() == 1 {
+            init_maze_gen()
+        } else {
+            print(world.colors.red, "Placement has changed and is no longer complete!")
+        }
+    } elif val == 2 {
+        remove_pos_markers()
+        print("Cancelled placement")
+    }
+}
+
+@ticking
+def handle_confirm_dialog() {
+    let pl:Player = world.get_player().with_score("maze_confirm_trigger", min=1).find()
+    pl.dialog_action()
+}
+
+def remove_pos_markers() {
+    
+    let markers:Group[Entity] = world.get_entities().with_tag("pos_marker").find()
+    
+    # Not yet implemented - idk, making the chain syntax up as I go...
+    ###markers.data.modify("Size").set.value(0)
+    /data modify entity @e[tag=marker1,limit=1] Size set value 0
+    /data modify entity @e[tag=marker2,limit=1] Size set value 0
+    
+    markers.tp(world.get_player().find().pos.get(dy=-380))
+}
+
+def validate_pos_markers() -> int {
+
+    # TEMP: for now, no way to access this data
+    /execute store result score marker1_posy maze_pos run data get entity @e[tag=marker1,limit=1] Pos[1]
+    /execute store result score marker2_posy maze_pos run data get entity @e[tag=marker2,limit=1] Pos[1]
+    
+    let posy1:int = world.scoreboard.obj("maze_pos").player("marker1_posy").get()
+    let posy2:int = world.scoreboard.obj("maze_pos").player("marker2_posy").get()
+    
+    if posy1 != posy2 {
+        return 1
+    }
+    
+    let width:int = calc_maze_width()
+    
+    if (width == 0) or (width == 1) or (width == -1) {
+        return 2
+    }
+    
+    let height:int = calc_maze_height()
+    
+    if (height == 0) or (height == 1) or (height == -1) {
+        return 3
+    }
+    
+    return 0
+}
+
+def display_error_message(code:int) {
+    if code == 1 {
+        print(world.colors.red, "Invalid position! Y level must match between each corner.")
+    } elif code == 2 {
+        print(world.colors.red, "Invalid position! X dimension must be greater than 1.")
+    } elif code == 3 {
+        print(world.colors.red, "Invalid position! Z dimension must be greater than 1.")
+    }
+}
+
+def init_maze_gen() {
+    # Validate
+    let err:int = validate_pos_markers()
+    
+    if err == 0 {
+        # Set the flag to make the stick inactive while generating
+        maze_generating = True
+        build_blank_maze()
+        # Initialise the path length to zero
+        world.scoreboard.obj("maze_pos").player("path_length").set(0)
+        # Tag the first marker, triggering the iterative generation
+        world.get_entity().with_tag("marker1").find().tag_add("maze_gen_running")
+    } else {
+        display_error_message(err)
+    }
+}
+
+def get_maze_width() -> int {
+    let posx1:int = world.scoreboard.obj("maze_pos").player("marker1_posx").get()
+    let posx2:int = world.scoreboard.obj("maze_pos").player("marker2_posx").get()
+    
+    return posx2 - posx1
+}
+
+def calc_maze_width() -> int {
+    
+    # Get the marker pos into a score
+    /execute store result score marker1_posx maze_pos run data get entity @e[tag=marker1,limit=1] Pos[0]
+    /execute store result score marker2_posx maze_pos run data get entity @e[tag=marker2,limit=1] Pos[0]
+    
+    return get_maze_width()
+}
+
+def get_maze_height() -> int {
+    let posz1:int = world.scoreboard.obj("maze_pos").player("marker1_posz").get()
+    let posz2:int = world.scoreboard.obj("maze_pos").player("marker2_posz").get()
+    
+    return posz2 - posz1
+}
+
+def calc_maze_height() -> int {
+    
+    # Get the marker pos into a score
+    /execute store result score marker1_posz maze_pos run data get entity @e[tag=marker1,limit=1] Pos[2]
+    /execute store result score marker2_posz maze_pos run data get entity @e[tag=marker2,limit=1] Pos[2]
+    
+    return get_maze_height()
+}
+
+def Entity step_dx(positive: bool) {
+    if positive {
+        this.tp(this.pos.get(dx=1))
+    } else {
+        this.tp(this.pos.get(dx=-1))
+    }
+}
+
+def Entity step_dz(positive: bool) {
+    if positive {
+        this.tp(this.pos.get(dz=1))
+    } else {
+        this.tp(this.pos.get(dz=-1))
+    }
+}
+
+def Entity set_gen_target() {
+
+    let cell:Entity = this.get_entity(sort="nearest").with_tag("unvisited_cell_marker").find()
+    
+    #let target1:Entity = world.summon(cell.pos.get(), "minecraft:marker") DEBUG!!!
+    let target1:Entity = world.summon(cell.pos.get(), "minecraft:armor_stand", "{Invisible:1b,NoGravity:1b,ArmorItems:[{},{},{},{id:\"minecraft:diamond_block\",Count:1b}]}")
+    target1.tag_add("maze_gen_target")
+    
+    let target2:Entity = world.summon(cell.pos.get(), "minecraft:marker")
+    target2.tag_add("maze_neighbour_spawner")
+    
+    cell.kill()
+
+}
+
+def Entity summon_cell_marker() {
+    let mark:Entity = this.summon(this.pos.get(), "minecraft:marker")
+    mark.tag_add("unvisited_cell_marker")
+}
+
+def build_blank_maze() {
+    print("building a maze...")
+    # Get the width and height
+    let width:int = get_maze_width()
+    let width_positive:bool = width > 0
+    var width_abs:int
+    if width_positive {
+        width_abs = width
+    } else {
+        width_abs = -width
+    }
+    
+    let height:int = get_maze_height()
+    let height_positive:bool = height > 0
+    var height_abs:int
+    if height_positive {
+        height_abs = height
+    } else {
+        height_abs = -height
+    }
+    
+    let maze_marker:Entity = world.get_entity().with_tag("marker1").find()
+    let maze_pos:Pos = maze_marker.pos.get()
+    let builder:Entity = world.summon(maze_pos, "minecraft:marker")
+    let builder_child:Entity = world.summon(maze_pos, "minecraft:marker")
+    
+    var yi:int = 0
+    
+    while (yi < height_abs) {
+        var xi:int = 0
+        while (xi < width_abs) {
+            world.setblock(builder_child.pos.get(), "minecraft:black_wool")
+            builder_child.step_dx(width_positive)
+            world.setblock(builder_child.pos.get(), "minecraft:black_wool")
+            builder_child.step_dx(width_positive)
+            xi = xi + 2
+        }
+        world.setblock(builder_child.pos.get(), "minecraft:black_wool")
+        builder.step_dz(height_positive)
+        builder_child.tp(builder.pos.get())
+        xi = 0
+        while (xi < width_abs) {
+            world.setblock(builder_child.pos.get(), "minecraft:black_wool")
+            builder_child.step_dx(width_positive)
+            world.setblock(builder_child.pos.get(), "minecraft:white_wool")
+            builder_child.summon_cell_marker()
+            builder_child.step_dx(width_positive)
+            xi = xi + 2
+        }
+        
+        world.setblock(builder_child.pos.get(), "minecraft:black_wool")
+        builder.step_dz(height_positive)
+        builder_child.tp(builder.pos.get())
+        yi = yi + 2
+    }
+    
+    xi = 0
+    while (xi < width_abs) {
+        world.setblock(builder_child.pos.get(), "minecraft:black_wool")
+        builder_child.step_dx(width_positive)
+        world.setblock(builder_child.pos.get(), "minecraft:black_wool")
+        builder_child.step_dx(width_positive)
+        xi = xi + 2
+    }
+    world.setblock(builder_child.pos.get(), "minecraft:black_wool")
+    
+    maze_marker.set_gen_target()
+
+    builder.kill()
+    builder_child.kill()
+}   
+
+@ticking
+def check_iterate_maze_gen() {
+    let marker:Entity = world.get_entity().with_tag("maze_gen_running").find()
+    marker.call_iterate_maze_gen()
+}
+
+def Entity call_iterate_maze_gen() {
+    tick_count = tick_count + 1
+    if tick_count == 5 {
+        tick_count = 0
+        this.iterate_maze_gen()
+    }
+}
+
+def Entity spawn_neighbour_child() {
+    world.summon(this.pos.get(), "minecraft:marker", "{Tags:[\"neighbour_marker\"]}")
+}
+
+def Entity spawn_neighbour() -> bool {
+    let cell_marker:Entity = this.get_entity().in_radius(min=0.0, max=0.75).with_tag("unvisited_cell_marker").find()
+    cell_marker.spawn_neighbour_child()
+    return world.entity_exists(cell_marker)
+}
+
+def Entity place_block_nearest() {
+    let block_pos:Pos = this.get_entity(sort="nearest").with_tag("connector_marker").find().pos.get()
+    world.setblock(block_pos, "minecraft:white_wool")
+}
+
+def Entity set_cell_visited() {
+    this.get_entity().in_radius(min=0.0, max=0.75).with_tag("unvisited_cell_marker").find().kill()
+}
+
+def Entity add_path_marker() {
+    #let marker:Entity = world.summon(this.pos.get(), "minecraft:marker", "{Tags:[\"path_marker\"]}")
+    let marker:Entity = world.summon(this.pos.get(), "minecraft:armor_stand", "{Invisible:1b,NoGravity:1b,Tags:[\"path_marker\"],ArmorItems:[{},{},{},{id:\"minecraft:emerald_block\",Count:1b}]}")
+    let length:int = world.scoreboard.obj("maze_pos").player("path_length").get()
+    marker.scoreboard.obj("maze_pos").set(length)
+}
+
+def Entity get_previous() -> Entity {
+    # Tag all of the path markers
+    world.get_entities().with_tag("path_marker").find().tag_add("path_search_unchecked")
+    let path_length:int = world.scoreboard.obj("maze_pos").player("path_length").get()
+    var searching:bool = True
+    while (searching) {
+        let path_marker:Entity = this.get_entity(sort="nearest").with_tag("path_search_unchecked").find()
+        if world.entity_exists(path_marker) {
+            let marker_len:int = path_marker.scoreboard.obj("maze_pos").get()
+            if marker_len == path_length {
+                return path_marker
+            } else {
+                path_marker.tag_remove("path_search_unchecked")
+            }
+        } else {
+            searching = False
+        }
+    }
+    print(world.colors.red, "[ERROR] Couldn't find previous path marker!!!")
+    return this
+}
+
+def Entity iterate_maze_gen() {
+    # Check if complete
+    let any_unvisited_cell:Entity = world.get_entity().with_tag("unvisited_cell_marker").find()
+    var in_progress:bool = world.entity_exists(any_unvisited_cell)
+    
+    let neighbour_spawner:Entity = world.get_entity().with_tag("maze_neighbour_spawner").find()
+    let current_pos:Entity = world.get_entity().with_tag("maze_gen_target").find()
+    
+    if not in_progress {
+        print(world.colors.green, "complete!")
+        maze_generating = False
+        remove_pos_markers()
+        world.get_entities().with_tag("path_marker").find().kill()
+        this.scoreboard.obj("maze_setup_state").set(0)
+        neighbour_spawner.kill()
+        current_pos.kill()
+        return null
+    }
+    
+    # Create neighbours
+    var any_spawned:bool = False
+    var spawned:bool
+    neighbour_spawner.tp(current_pos.pos.get(dx=2))
+    spawned = neighbour_spawner.spawn_neighbour()
+    any_spawned = spawned
+    if spawned {
+        world.summon(current_pos.pos.get(dx=1), "minecraft:marker", "{Tags:[\"connector_marker\"]}")
+    }
+    
+    neighbour_spawner.tp(current_pos.pos.get(dx=-2))
+    spawned = neighbour_spawner.spawn_neighbour()
+    any_spawned = any_spawned or spawned
+    if spawned {
+        world.summon(current_pos.pos.get(dx=-1), "minecraft:marker", "{Tags:[\"connector_marker\"]}")
+    }
+    
+    neighbour_spawner.tp(current_pos.pos.get(dz=2))
+    spawned = neighbour_spawner.spawn_neighbour()
+    any_spawned = any_spawned or spawned
+    if spawned {
+        world.summon(current_pos.pos.get(dz=1), "minecraft:marker", "{Tags:[\"connector_marker\"]}")
+    }
+    
+    neighbour_spawner.tp(current_pos.pos.get(dz=-2))
+    spawned = neighbour_spawner.spawn_neighbour()
+    any_spawned = any_spawned or spawned
+    if spawned {
+        world.summon(current_pos.pos.get(dz=-1), "minecraft:marker", "{Tags:[\"connector_marker\"]}")
+    }
+    
+    if any_spawned {
+        print(world.colors.green, "connecting...")
+        # Pick a random neighbour
+        let choice:Entity = world.get_entity(sort="random").with_tag("neighbour_marker").find()
+        # Call the place block on that neighbour
+        choice.place_block_nearest()
+        # increment path length score
+        world.scoreboard.obj("maze_pos").player("path_length").add(1)
+        # Place a new path marker at current pos, using the updated score
+        current_pos.add_path_marker()
+        # Move to that neighbour
+        current_pos.tp(choice.pos.get())
+        # Delete the unvisited marker at the new location
+        current_pos.set_cell_visited()
+        # clean up markers
+        world.get_entities().with_tag("connector_marker").find().kill()
+        world.get_entities().with_tag("neighbour_marker").find().kill()
+    } else {
+        print(world.colors.gold, "back tracking")
+        # Spawned no neighbour, back track
+        # Step 1. find the last path marker, move to it, then kill it
+        var previous_marker:Entity = current_pos.get_previous()
+        current_pos.tp(previous_marker.pos.get())
+        previous_marker.kill()
+        # Step 2. decrease the path length score
+        world.scoreboard.obj("maze_pos").player("path_length").sub(1)
+       
+    }
+}   
+
+# Give the magic stick, if they don't have one already.
+let player:Player = world.get_player("nearest").not_matching_nbt(HAS_MAGIC_STICK_NBT).find()
+player.give_magic_stick()
+player.scoreboard.obj("maze_setup_state").set(0)
